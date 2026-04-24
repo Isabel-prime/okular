@@ -1,3 +1,7 @@
+# Custom tab bahaviour for this fork
+
+In Windows, the current Okular release has a bug where the 'open new documents as tabs' feature doesn't work at a file system level. This fork fixes that bug, and also adds the feature that you can drag open tabs between Okular instances. The 'recent documents' history is shared between all instances instead of being window-specific.
+
 # Okular – Universal Document Viewer
 
 Okular can view and annotate documents of various formats, including PDF, Postscript, Comic Book, and various image formats.
