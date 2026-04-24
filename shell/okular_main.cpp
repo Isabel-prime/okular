@@ -222,6 +222,17 @@ Status main(const QStringList &paths, const QString &serializedOptions)
         return AttachedOtherProcess;
     }
 
+#ifdef Q_OS_WIN
+    // On Windows, D-Bus is unavailable so the functions above are no-ops.
+    // Use the named-pipe IPC server that the first Okular instance starts
+    // to route file-open requests into an existing window as tabs.
+    if (!ShellUtils::showPrintDialogAndExit(serializedOptions)) {
+        if (Shell::tryAttachToExistingInstance(paths, serializedOptions)) {
+            return AttachedOtherProcess;
+        }
+    }
+#endif
+
     Shell *shell = new Shell(serializedOptions);
     if (!shell->isValid()) {
         return Error;

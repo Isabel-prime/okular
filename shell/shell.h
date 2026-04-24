@@ -17,6 +17,8 @@
 #include <QList>
 #include <QMimeDatabase>
 #include <QMimeType>
+#include <QSet>
+#include <QUrl>
 #include <kparts/mainwindow.h>
 #include <kparts/readwritepart.h>
 
@@ -32,6 +34,8 @@
 class Sidebar;
 class KRecentFilesAction;
 class KToggleAction;
+class QDropEvent;
+class QLocalServer;
 class QTabWidget;
 class KPluginFactory;
 
@@ -70,6 +74,29 @@ public:
     bool isValid() const;
 
     bool openDocument(const QUrl &url, const QString &serializedOptions);
+
+    /**
+     * Detach an existing tab from this shell and return its part.
+     * The caller takes ownership of the returned part and must either
+     * attach it to another Shell or delete it.  If this was the last
+     * tab the shell will close itself.
+     */
+    KParts::ReadWritePart *detachTab(int index);
+
+    /**
+     * Adopt an already-created part (previously returned by detachTab)
+     * as a new tab in this shell.
+     */
+    void attachTab(KParts::ReadWritePart *part);
+
+#ifdef Q_OS_WIN
+    /**
+     * Try to send @p paths to an already-running Okular instance via the
+     * Windows named-pipe IPC server.  Returns true if successful (the
+     * caller should then exit without creating a new window).
+     */
+    static bool tryAttachToExistingInstance(const QStringList &paths, const QString &serializedOptions);
+#endif
 
 public Q_SLOTS:
     Q_SCRIPTABLE Q_NOREPLY void tryRaise(const QString &startupId);
@@ -173,6 +200,27 @@ private:
     int findTabIndex(const QUrl &url) const;
     void readRecentFilesSettings();
 
+    // Tab drag/tear-off helpers
+    void startTabDrag(int tabIndex, const QPoint &globalPos);
+    void handleTabDrop(QDropEvent *event);
+
+#ifdef Q_OS_WIN
+    // Windows named-pipe IPC (replaces D-Bus for single-instance routing)
+    void startIpcServer();
+    void onIpcNewConnection();
+    static QString ipcServerName();
+    static QLocalServer *s_ipcServer;
+#endif
+
+    // Registry of all live Shell instances (used for safe cross-window drag)
+    static QSet<Shell *> s_allShells;
+
+    // Set to true by any Shell's drop handler when an okular-tab drop is
+    // accepted, so the source can distinguish "dropped on a known shell"
+    // (don't tear off) from "dropped on empty space / external target"
+    // (tear off into a new window).
+    static bool s_tabDropHandled;
+
 private:
     void reloadAllXML();
     bool eventFilter(QObject *obj, QEvent *event) override;
@@ -213,6 +261,10 @@ private:
     QAction *m_lockSidebarAction = nullptr;
 
     bool m_isValid;
+
+    // Tab drag state (tracked in eventFilter)
+    int m_draggedTabIndex = -1;
+    QUrl m_draggedTabUrl;
 };
 
 #endif

@@ -24,22 +24,26 @@ ki18n_wrap_ui(okular_SRCS
 file(GLOB ICONS_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/../icons/*-apps-okular.png")
 ecm_add_app_icon(okular_SRCS ICONS ${ICONS_SRCS})
 
-add_executable(okular ${okular_SRCS})
+add_executable(ockular ${okular_SRCS})
 
-target_link_libraries(okular KF6::I18n KF6::Parts KF6::WindowSystem KF6::Crash KF6::IconThemes KF6::KIOGui)
+target_link_libraries(ockular KF6::I18n KF6::Parts KF6::WindowSystem KF6::Crash KF6::IconThemes KF6::KIOGui)
 if (TARGET Qt6::DBus)
-    target_link_libraries(okular Qt6::DBus)
+    target_link_libraries(ockular Qt6::DBus)
 endif()
 if (HAVE_X11)
-    target_link_libraries(okular Qt6::GuiPrivate)
+    target_link_libraries(ockular Qt6::GuiPrivate)
+endif()
+if (WIN32)
+    # QLocalServer / QLocalSocket (Windows named-pipe IPC for single-instance routing)
+    target_link_libraries(ockular Qt6::Network)
 endif()
 
-install(TARGETS okular ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
+install(TARGETS ockular ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
 
 if(APPLE)
-    set_target_properties(okular PROPERTIES
-        MACOSX_BUNDLE_DISPLAY_NAME "Okular"
-        MACOSX_BUNDLE_BUNDLE_NAME "Okular"
+    set_target_properties(ockular PROPERTIES
+        MACOSX_BUNDLE_DISPLAY_NAME "Ockular"
+        MACOSX_BUNDLE_BUNDLE_NAME "Ockular"
         MACOSX_BUNDLE_ICON_FILE "okular_SRCS"
         MACOSX_BUNDLE_LONG_VERSION_STRING "Okular ${RELEASE_SERVICE_VERSION}"
         MACOSX_BUNDLE_SHORT_VERSION_STRING "${RELEASE_SERVICE_VERSION_MAJOR}.${RELEASE_SERVICE_VERSION_MINOR}"

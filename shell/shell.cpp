@@ -41,10 +41,19 @@
 #if HAVE_DBUS
 #include <QDBusConnection>
 #endif // HAVE_DBUS
+#include <QDataStream>
 #include <QDockWidget>
+#include <QDrag>
+#include <QDragEnterEvent>
 #include <QDragMoveEvent>
+#include <QDropEvent>
 #include <QFileDialog>
 #include <QJsonArray>
+#ifdef Q_OS_WIN
+#include <QLocalServer>
+#include <QLocalSocket>
+#endif
+#include <QMenu>
 #include <QMenuBar>
 #include <QMimeData>
 #include <QObject>
@@ -69,6 +78,7 @@ static const char *const SESSION_URL_KEY = "Urls";
 static const char *const SESSION_TAB_KEY = "ActiveTab";
 
 static constexpr char SIDEBAR_LOCKED_KEY[] = "LockSidebar";
+static constexpr char s_okularTabMime[] = "application/x-okular-tab";
 static constexpr char SIDEBAR_VISIBLE_KEY[] = "ShowSidebar";
 
 static inline QString DesktopEntryGroupKey()
@@ -180,16 +190,25 @@ private:
     QWidget *m_dumbTitleWidget = nullptr;
 };
 
+// Static member definitions
+QSet<Shell *> Shell::s_allShells;
+bool Shell::s_tabDropHandled = false;
+#ifdef Q_OS_WIN
+QLocalServer *Shell::s_ipcServer = nullptr;
+#endif
+
 Shell::Shell(const QString &serializedOptions)
     : KParts::MainWindow()
     , m_menuBarWasShown(true)
     , m_toolBarWasShown(true)
     , m_isValid(true)
 {
+    s_allShells.insert(this);
+
     setObjectName(QStringLiteral("okular::Shell#"));
     setContextMenuPolicy(Qt::NoContextMenu);
     // otherwise .rc file won't be found by unit test
-    setComponentName(QStringLiteral("okular"), QString());
+    setComponentName(QStringLiteral("ockular"), QString());
     // set the shell's ui resource file
     setXMLFile(QStringLiteral("shell.rc"));
     m_fileformatsscanned = false;
@@ -231,11 +250,14 @@ Shell::Shell(const QString &serializedOptions)
         m_tabWidget = new QTabWidget(this);
         m_tabWidget->setTabsClosable(true);
         m_tabWidget->setElideMode(Qt::ElideRight);
-        m_tabWidget->tabBar()->hide();
+        // Tab bar is always visible (even with 1 tab) so users can drag tabs
+        // in or out to rearrange across windows.
+        m_tabWidget->tabBar()->show();
         m_tabWidget->setDocumentMode(true);
         m_tabWidget->setMovable(true);
 
         m_tabWidget->setAcceptDrops(true);
+        m_tabWidget->tabBar()->setAcceptDrops(true);
         m_tabWidget->tabBar()->installEventFilter(this);
 
         m_centralStackedWidget->addWidget(m_tabWidget);
@@ -308,6 +330,14 @@ Shell::Shell(const QString &serializedOptions)
         QDBusConnection::sessionBus().registerObject(QStringLiteral("/okularshell"), this, QDBusConnection::ExportScriptableSlots);
 #endif // HAVE_DBUS
 
+#ifdef Q_OS_WIN
+        // On Windows there is no D-Bus, so use a named pipe to route new
+        // file-open requests from the OS into this (the first) instance.
+        if (!s_ipcServer) {
+            startIpcServer();
+        }
+#endif
+
         // Make sure that the welcome scren is visible on startup.
         showWelcomeScreen();
     } else {
@@ -334,6 +364,102 @@ void Shell::keyPressEvent(QKeyEvent *e)
 
 bool Shell::eventFilter(QObject *obj, QEvent *event)
 {
+    // ---------------------------------------------------------------
+    // Tab-bar specific handling (drag-out detection + cross-window drop)
+    // ---------------------------------------------------------------
+    if (obj == m_tabWidget->tabBar()) {
+        switch (event->type()) {
+
+        case QEvent::MouseButtonPress: {
+            QMouseEvent *me = static_cast<QMouseEvent *>(event);
+            if (me->button() == Qt::LeftButton) {
+                m_draggedTabIndex = m_tabWidget->tabBar()->tabAt(me->pos());
+                if (m_draggedTabIndex >= 0) {
+                    m_draggedTabUrl = m_tabs[m_draggedTabIndex].part->url();
+                }
+            }
+            break;
+        }
+
+        case QEvent::MouseMove: {
+            QMouseEvent *me = static_cast<QMouseEvent *>(event);
+            if ((me->buttons() & Qt::LeftButton) && m_draggedTabIndex >= 0 && m_tabs.size() > 0) {
+                // Only trigger cross-window drag when the cursor has left the tab bar
+                if (!m_tabWidget->tabBar()->rect().contains(me->pos())) {
+                    const int idx = m_draggedTabIndex;
+                    m_draggedTabIndex = -1; // Reset before starting drag to avoid re-entry
+
+                    // Send a synthetic mouse-release to cancel QTabBar's own drag
+                    // (QTabBar with setMovable() holds mouse state internally)
+                    QMouseEvent fakeRelease(QEvent::MouseButtonRelease,
+                                            me->position(),
+                                            me->globalPosition(),
+                                            Qt::LeftButton,
+                                            Qt::NoButton,
+                                            me->modifiers());
+                    QApplication::sendEvent(m_tabWidget->tabBar(), &fakeRelease);
+
+                    // Re-find by URL in case within-bar reordering shifted the index
+                    const int currentIdx = findTabIndex(m_draggedTabUrl);
+                    startTabDrag(currentIdx >= 0 ? currentIdx : idx,
+                                 me->globalPosition().toPoint());
+                    return true;
+                }
+            }
+            break;
+        }
+
+        case QEvent::MouseButtonRelease: {
+            QMouseEvent *me = static_cast<QMouseEvent *>(event);
+            m_draggedTabIndex = -1;
+            if (me->button() == Qt::MiddleButton) {
+                const int tabIndex = m_tabWidget->tabBar()->tabAt(me->pos());
+                if (tabIndex != -1) {
+                    closeTab(tabIndex);
+                    return true;
+                }
+            }
+            break;
+        }
+
+        case QEvent::DragEnter: {
+            QDragEnterEvent *de = static_cast<QDragEnterEvent *>(event);
+            if (de->mimeData()->hasFormat(QLatin1String(s_okularTabMime))) {
+                de->acceptProposedAction();
+                return true;
+            }
+            break; // Fall through to generic URL handling below
+        }
+
+        case QEvent::DragMove: {
+            QDragMoveEvent *dm = static_cast<QDragMoveEvent *>(event);
+            if (dm->mimeData()->hasFormat(QLatin1String(s_okularTabMime))) {
+                dm->acceptProposedAction();
+                return true;
+            }
+            break;
+        }
+
+        case QEvent::Drop: {
+            QDropEvent *de = static_cast<QDropEvent *>(event);
+            if (de->mimeData()->hasFormat(QLatin1String(s_okularTabMime))) {
+                s_tabDropHandled = true;
+                handleTabDrop(de);
+                de->setDropAction(Qt::MoveAction);
+                de->accept();
+                return true;
+            }
+            break; // Fall through to generic URL handling below
+        }
+
+        default:
+            break;
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Generic URL-drop handling (file manager → welcome screen / tab widget)
+    // ---------------------------------------------------------------
     QDragMoveEvent *dmEvent = dynamic_cast<QDragMoveEvent *>(event);
     if (dmEvent) {
         bool accept = dmEvent->mimeData()->hasUrls();
@@ -349,17 +475,6 @@ bool Shell::eventFilter(QObject *obj, QEvent *event)
         return true;
     }
 
-    // Handle middle button click events on the tab bar
-    if (obj == m_tabWidget->tabBar() && event->type() == QEvent::MouseButtonRelease) {
-        QMouseEvent *mEvent = static_cast<QMouseEvent *>(event);
-        if (mEvent->button() == Qt::MiddleButton) {
-            int tabIndex = m_tabWidget->tabBar()->tabAt(mEvent->pos());
-            if (tabIndex != -1) {
-                closeTab(tabIndex);
-                return true;
-            }
-        }
-    }
     return KParts::MainWindow::eventFilter(obj, event);
 }
 
@@ -370,11 +485,16 @@ bool Shell::isValid() const
 
 void Shell::showOpenRecentMenu()
 {
+    // Reload from disk first so additions made by other Okular windows
+    // (which save to the same KConfig group) are reflected in this menu.
+    m_recent->loadEntries(KSharedConfig::openConfig()->group(RecentFilesGroupKey()));
     m_recent->menu()->popup(QCursor::pos());
 }
 
 Shell::~Shell()
 {
+    s_allShells.remove(this);
+
     if (!m_tabs.empty()) {
         writeSettings();
         for (const TabState &tab : std::as_const(m_tabs)) {
@@ -387,6 +507,24 @@ Shell::~Shell()
         QDBusConnection::sessionBus().unregisterService(QStringLiteral("org.kde.okular"));
     }
 #endif // HAVE_DBUS
+
+#ifdef Q_OS_WIN
+    // If this shell owned the IPC server and there are other shells remaining,
+    // pass ownership to the next one so new file-opens keep working.
+    if (s_ipcServer && s_ipcServer->parent() == this) {
+        if (!s_allShells.isEmpty()) {
+            Shell *next = *s_allShells.begin();
+            s_ipcServer->setParent(next);
+            // Reconnect the newConnection signal to the new owner
+            disconnect(s_ipcServer, &QLocalServer::newConnection, this, &Shell::onIpcNewConnection);
+            connect(s_ipcServer, &QLocalServer::newConnection, next, &Shell::onIpcNewConnection);
+        } else {
+            // Last window closing – destroy the server so the pipe name is freed
+            delete s_ipcServer;
+            s_ipcServer = nullptr;
+        }
+    }
+#endif
 
     delete m_tabWidget;
 }
@@ -489,8 +627,10 @@ void Shell::openUrl(const QUrl &url, const QString &serializedOptions)
         if (!isstdin) {
             if (openOk) {
                 m_recent->addUrl(url);
+                saveRecents();
             } else {
                 m_recent->removeUrl(url);
+                saveRecents();
                 closeTab(activeTab);
             }
         }
@@ -566,6 +706,13 @@ void Shell::setupActions()
     m_recent->setToolBarMode(KRecentFilesAction::MenuMode);
     connect(m_recent, &QAction::triggered, this, &Shell::showOpenRecentMenu);
     connect(m_recent, &KRecentFilesAction::recentListCleared, this, &Shell::refreshRecentsOnWelcomeScreen);
+    // Reload from disk every time the menu is about to be shown, so additions
+    // made by other Okular windows (which save to the same KConfig group)
+    // appear here. This covers the File → Open Recent submenu, where
+    // showOpenRecentMenu's triggered signal does not fire.
+    connect(m_recent->menu(), &QMenu::aboutToShow, this, [this]() {
+        m_recent->loadEntries(KSharedConfig::openConfig()->group(RecentFilesGroupKey()));
+    });
     connect(m_welcomeScreen, &WelcomeScreen::forgetAllRecents, m_recent, &KRecentFilesAction::clear);
     m_recent->setToolTip(i18n("Click to open a file\nClick and hold to open a recent file"));
     m_recent->setWhatsThis(i18n("<b>Click</b> to open a file or <b>Click and hold</b> to select a recent file"));
@@ -883,6 +1030,10 @@ bool Shell::queryClose()
 
 void Shell::setActiveTab(int tab)
 {
+    if (tab < 0 || tab >= m_tabs.size()) {
+        return;
+    }
+
     if (m_showSidebarAction) {
         m_showSidebarAction->disconnect(m_sidebar);
     }
@@ -941,7 +1092,8 @@ void Shell::closeTab(int tab)
         m_closedTabUrls.append(url);
 
         if (m_tabWidget->count() == 1) {
-            m_tabWidget->tabBar()->hide();
+            // Tab bar stays visible so the remaining tab can still be
+            // dragged out to a new window.
             m_nextTabAction->setEnabled(false);
             m_prevTabAction->setEnabled(false);
         }
@@ -968,13 +1120,14 @@ void Shell::openNewTab(const QUrl &url, const QString &serializedOptions)
         if (tabIndex >= 0) {
             setActiveTab(tabIndex);
             m_recent->addUrl(url);
+            saveRecents();
             return;
         }
     }
 
-    // Tabs are hidden when there's only one, so show it
+    // Tab bar is always visible now; just enable the next/prev actions
+    // when we go from 1 to 2 tabs.
     if (m_tabs.size() == 1) {
-        m_tabWidget->tabBar()->show();
         m_nextTabAction->setEnabled(true);
         m_prevTabAction->setEnabled(true);
     }
@@ -996,10 +1149,12 @@ void Shell::openNewTab(const QUrl &url, const QString &serializedOptions)
 
     if (part->openUrl(url)) {
         m_recent->addUrl(url);
+        saveRecents();
     } else {
         setActiveTab(previousActiveTab);
         closeTab(m_tabs.size() - 1);
         m_recent->removeUrl(url);
+        saveRecents();
     }
 }
 
@@ -1167,7 +1322,10 @@ void Shell::showWelcomeScreen()
 
 void Shell::refreshRecentsOnWelcomeScreen()
 {
-    saveRecents();
+    // Reload this shell's m_recent from disk first, so additions made by
+    // other Okular windows (which save to the same KConfig group) are
+    // merged in before the welcome screen reads from disk.
+    m_recent->loadEntries(KSharedConfig::openConfig()->group(RecentFilesGroupKey()));
     m_welcomeScreen->loadRecents();
 }
 
@@ -1200,6 +1358,394 @@ void Shell::readRecentFilesSettings()
     m_welcomeScreen->setMaxRecentItems(m_recent->maxItems());
     m_welcomeScreen->loadRecents();
     m_recent->loadEntries(KSharedConfig::openConfig()->group(RecentFilesGroupKey()));
+}
+
+// -----------------------------------------------------------------------
+// Windows IPC implementation (replaces D-Bus for single-instance routing)
+// -----------------------------------------------------------------------
+#ifdef Q_OS_WIN
+
+QString Shell::ipcServerName()
+{
+    // Include the user name so that different Windows users on the same
+    // machine each get their own server pipe.
+    const QString user = qEnvironmentVariable("USERNAME", QStringLiteral("default"));
+    return QStringLiteral("ockular-ipc-") + user;
+}
+
+bool Shell::tryAttachToExistingInstance(const QStringList &paths, const QString &serializedOptions)
+{
+    if (paths.isEmpty()) {
+        return false;
+    }
+
+    QLocalSocket socket;
+    socket.connectToServer(ipcServerName());
+    if (!socket.waitForConnected(500)) {
+        return false; // No server running – we are the first instance
+    }
+
+    // Convert raw command-line paths to proper file:// URL strings so the
+    // receiver doesn't mistake "C:\..." for a URL with protocol "c".
+    const QString page = ShellUtils::page(serializedOptions);
+    QStringList urlStrings;
+    urlStrings.reserve(paths.size());
+    for (const QString &p : paths) {
+        urlStrings.append(ShellUtils::urlFromArg(p, ShellUtils::qfileExistFunc(), page).url());
+    }
+
+    QByteArray payload;
+    {
+        QDataStream ds(&payload, QIODevice::WriteOnly);
+        ds << urlStrings << serializedOptions;
+    }
+
+    // Length-prefix the payload so the receiver knows when it has all data
+    QByteArray packet;
+    {
+        QDataStream ds(&packet, QIODevice::WriteOnly);
+        ds << static_cast<quint32>(payload.size());
+    }
+    packet.append(payload);
+
+    socket.write(packet);
+    socket.flush();
+    socket.waitForBytesWritten(2000);
+    socket.disconnectFromServer();
+    socket.waitForDisconnected(1000);
+
+    return true;
+}
+
+void Shell::startIpcServer()
+{
+    // Remove a stale socket from a previous crash (no-op on Windows named pipes)
+    QLocalServer::removeServer(ipcServerName());
+
+    s_ipcServer = new QLocalServer(this);
+    if (!s_ipcServer->listen(ipcServerName())) {
+        qWarning("Ockular IPC: failed to listen on '%s': %s",
+                 qUtf8Printable(ipcServerName()),
+                 qUtf8Printable(s_ipcServer->errorString()));
+        delete s_ipcServer;
+        s_ipcServer = nullptr;
+        return;
+    }
+
+    connect(s_ipcServer, &QLocalServer::newConnection, this, &Shell::onIpcNewConnection);
+}
+
+void Shell::onIpcNewConnection()
+{
+    QLocalSocket *client = s_ipcServer->nextPendingConnection();
+    if (!client) {
+        return;
+    }
+
+    // Buffer incoming data; process once the client disconnects (short messages)
+    QByteArray *buffer = new QByteArray();
+
+    connect(client, &QLocalSocket::readyRead, this, [buffer, client]() {
+        buffer->append(client->readAll());
+    });
+
+    connect(client, &QLocalSocket::disconnected, this, [this, buffer, client]() {
+        client->deleteLater();
+
+        if (buffer->size() < static_cast<int>(sizeof(quint32))) {
+            delete buffer;
+            return;
+        }
+
+        QDataStream ds(*buffer);
+        quint32 payloadSize = 0;
+        ds >> payloadSize;
+
+        if (static_cast<quint32>(buffer->size()) < sizeof(quint32) + payloadSize) {
+            delete buffer; // Incomplete message – ignore
+            return;
+        }
+
+        QStringList paths;
+        QString options;
+        ds >> paths >> options;
+        delete buffer;
+
+        // Pick the best shell: prefer the active window, otherwise this one
+        Shell *target = this;
+        for (Shell *shell : std::as_const(s_allShells)) {
+            if (shell->isActiveWindow()) {
+                target = shell;
+                break;
+            }
+        }
+
+        for (const QString &path : std::as_const(paths)) {
+            const QUrl url(path);
+            if (!target->openDocument(url, options)) {
+                // The target shell refused (existing tab is occupied and the
+                // user has "open in tabs" disabled).  Mirror what main()'s
+                // loop does: spin up a fresh Shell to host the document.
+                Shell *fresh = new Shell(options);
+                if (fresh->isValid()) {
+                    fresh->show();
+                    fresh->openDocument(url, options);
+                    target = fresh; // route any remaining paths here too
+                } else {
+                    delete fresh;
+                }
+            }
+        }
+
+        target->activateWindow();
+        target->raise();
+    });
+}
+
+#endif // Q_OS_WIN
+
+// -----------------------------------------------------------------------
+// Tab detach / attach  (used by drag-tear-off and cross-window drop)
+// -----------------------------------------------------------------------
+
+KParts::ReadWritePart *Shell::detachTab(int index)
+{
+    Q_ASSERT(index >= 0 && index < m_tabs.size());
+
+    KParts::ReadWritePart *part = m_tabs[index].part;
+
+    // Remove from the XMLGUI factory
+    if (part->factory()) {
+        part->factory()->removeClient(part);
+    }
+
+    // Disconnect signals in both directions between the part and this shell
+    part->disconnect(this);
+    disconnect(this, nullptr, part, nullptr);
+
+    // Remove the sidebar widget that belongs to this part
+    Okular::ViewerInterface *iPart = qobject_cast<Okular::ViewerInterface *>(part);
+    Q_ASSERT(iPart);
+    QWidget *sideContainer = iPart->getSideContainer();
+    m_sidebar->removeWidget(sideContainer);
+
+    // Update internal state BEFORE removing the visual tab, so that the
+    // currentChanged → setActiveTab() callback sees consistent indices.
+    m_tabs.removeAt(index);
+
+    // Remove the visual tab (triggers currentChanged → setActiveTab if needed).
+    // The widget must still be accessible to QTabWidget during this call.
+    m_tabWidget->removeTab(index);
+
+    // Now safely orphan the part's widget so it is NOT deleted when the old
+    // tab widget (or this shell) is eventually destroyed.
+    part->widget()->hide();
+    part->widget()->setParent(nullptr);
+
+    // Tab bar stays visible; just disable next/prev when only 1 tab remains
+    if (m_tabWidget->count() == 1) {
+        m_nextTabAction->setEnabled(false);
+        m_prevTabAction->setEnabled(false);
+    }
+
+    // Transfer ownership of the part object away from this shell
+    part->setParent(nullptr);
+
+    return part;
+}
+
+void Shell::attachTab(KParts::ReadWritePart *part)
+{
+    // If the shell is in its initial empty state (exactly one tab with no URL,
+    // welcome screen still showing), discard the placeholder so we don't end up
+    // with an unwanted blank tab alongside the incoming document.
+    if (m_tabs.size() == 1
+        && m_tabs[0].part->url().isEmpty()
+        && m_centralStackedWidget->currentWidget() == m_welcomeScreen) {
+        KParts::ReadWritePart *placeholder = m_tabs.takeFirst().part;
+        if (placeholder->factory()) {
+            placeholder->factory()->removeClient(placeholder);
+        }
+        Okular::ViewerInterface *iPlace = qobject_cast<Okular::ViewerInterface *>(placeholder);
+        if (iPlace) {
+            m_sidebar->removeWidget(iPlace->getSideContainer());
+        }
+        placeholder->disconnect(this);
+        disconnect(this, nullptr, placeholder, nullptr);
+        // removeTab triggers currentChanged(-1) → setActiveTab(-1) → guard returns early
+        m_tabWidget->removeTab(0);
+        placeholder->deleteLater();
+        // m_tabs is now empty; m_tabWidget has 0 visual tabs
+    }
+
+    // Tab bar is always visible; enable next/prev when going from 1 to 2+ tabs
+    if (m_tabs.size() == 1) {
+        m_nextTabAction->setEnabled(true);
+        m_prevTabAction->setEnabled(true);
+    }
+
+    const int newIndex = m_tabs.size();
+
+    // Transfer ownership of the part to this shell
+    part->setParent(this);
+
+    m_tabs.append(TabState(part));
+    connectPart(part);
+
+    const QUrl url = part->url();
+    // addTab reparents part->widget() to the tab widget's internal stacked widget
+    m_tabWidget->addTab(part->widget(), url.fileName());
+    m_tabWidget->setTabToolTip(newIndex, url.fileName());
+
+    // setActiveTab must come before hideWelcomeScreen so that m_showSidebarAction
+    // is refreshed from the new part before the sidebar visibility is applied.
+    setActiveTab(newIndex);
+    hideWelcomeScreen();
+
+    // Restore the tab icon if the part can provide a MIME type
+    QMimeDatabase mdb;
+    const QMimeType mt = mdb.mimeTypeForUrl(url);
+    if (mt.isValid()) {
+        m_tabWidget->setTabIcon(newIndex, QIcon::fromTheme(mt.iconName()));
+    }
+}
+
+// -----------------------------------------------------------------------
+// Tab drag / tear-off
+// -----------------------------------------------------------------------
+
+void Shell::startTabDrag(int tabIndex, const QPoint &globalPos)
+{
+    Q_UNUSED(globalPos);
+
+    if (tabIndex < 0 || tabIndex >= m_tabs.size()) {
+        return;
+    }
+
+    // Grab a thumbnail of the page being dragged for the drag cursor
+    QPixmap thumb;
+    if (QWidget *page = m_tabWidget->widget(tabIndex)) {
+        QPixmap full = page->grab();
+        // Scale down to a quarter-size thumbnail
+        thumb = full.scaled(full.size() / 4, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    }
+
+    // Build the MIME data: process-id + Shell* + tab-index
+    // The process-id acts as a safety check so that drops from other
+    // processes (which would have an invalid pointer) are ignored.
+    QByteArray tabData;
+    {
+        QDataStream ds(&tabData, QIODevice::WriteOnly);
+        ds << static_cast<quint64>(QCoreApplication::applicationPid())
+           << static_cast<quintptr>(reinterpret_cast<quintptr>(this))
+           << static_cast<qint32>(tabIndex);
+    }
+
+    QMimeData *mime = new QMimeData();
+    mime->setData(QLatin1String(s_okularTabMime), tabData);
+    // Note: deliberately NOT calling setUrls() — on Windows that lets
+    // Explorer/desktop accept the drop (creating a shortcut and returning
+    // CopyAction), which prevents tear-off from working.
+
+    QDrag *drag = new QDrag(this);
+    drag->setMimeData(mime);
+    if (!thumb.isNull()) {
+        drag->setPixmap(thumb);
+        drag->setHotSpot(QPoint(thumb.width() / 2, 4));
+    }
+
+    // Block until the drag finishes.  Don't rely on QDrag::exec()'s return
+    // value — on Windows it can return MoveAction even for ignored drops.
+    // Instead use s_tabDropHandled, which any Okular shell sets in its drop
+    // handler.  If still false after exec(), the drop landed outside Okular
+    // and we should tear off into a new window.
+    const bool wasLastTab = (m_tabs.size() == 1);
+    s_tabDropHandled = false;
+    drag->exec(Qt::MoveAction);
+
+    if (!s_tabDropHandled) {
+        // Dropped outside every Okular shell → tear off into a new window.
+        // Re-find the tab by URL in case within-bar reordering changed its index.
+        const int currentIndex = findTabIndex(m_draggedTabUrl);
+        if (currentIndex < 0) {
+            return; // Tab was already moved by a concurrent operation
+        }
+
+        const QUrl url = m_tabs[currentIndex].part->url();
+
+        Shell *newShell = new Shell();
+        if (!newShell->isValid()) {
+            delete newShell;
+            return;
+        }
+
+        // Position the new window near the current cursor
+        newShell->move(QCursor::pos() - QPoint(50, 10));
+        newShell->show();
+
+        // Open the same document in the new window's initial empty tab.
+        // This re-reads from the file, which preserves all state stored there
+        // (PDF annotations, scroll position, etc.) without the complexity of
+        // moving a live KParts::ReadWritePart between XMLGUI-managed shells.
+        newShell->openDocument(url, QString());
+
+        // Close the tab in this shell (prompts for unsaved changes if needed).
+        // For a single-tab shell, closeTab() shows the welcome screen.
+        closeTab(currentIndex);
+
+        // Schedule close of this shell if the torn-off tab was its only one.
+        if (wasLastTab) {
+            QTimer::singleShot(0, this, &Shell::close);
+        }
+    } else {
+        // The drop was accepted by some Okular shell via handleTabDrop().
+        // For a cross-shell move this shell may now be empty; close it.
+        // For an intra-shell drop, m_tabs is unchanged so we leave it alone.
+        if (wasLastTab && m_tabs.isEmpty()) {
+            QTimer::singleShot(0, this, &Shell::close);
+        }
+    }
+}
+
+void Shell::handleTabDrop(QDropEvent *event)
+{
+    const QByteArray data = event->mimeData()->data(QLatin1String(s_okularTabMime));
+    QDataStream ds(data);
+
+    quint64 pid = 0;
+    quintptr shellAddr = 0;
+    qint32 tabIndex = -1;
+    ds >> pid >> shellAddr >> tabIndex;
+
+    // Only accept drags from our own process (pointer would be invalid cross-process)
+    if (pid != static_cast<quint64>(QCoreApplication::applicationPid())) {
+        return;
+    }
+
+    Shell *sourceShell = reinterpret_cast<Shell *>(shellAddr);
+
+    // Validate the pointer against our registry before dereferencing it
+    if (!s_allShells.contains(sourceShell)) {
+        return;
+    }
+
+    if (sourceShell == this) {
+        // Intra-shell drop: QTabBar already handles within-bar reordering
+        return;
+    }
+
+    if (tabIndex < 0 || tabIndex >= sourceShell->m_tabs.size()) {
+        return;
+    }
+
+    const bool sourceWasLast = (sourceShell->m_tabs.size() == 1);
+
+    KParts::ReadWritePart *part = sourceShell->detachTab(tabIndex);
+    attachTab(part);
+
+    if (sourceWasLast) {
+        QTimer::singleShot(0, sourceShell, &Shell::close);
+    }
 }
 
 #include "shell.moc"
